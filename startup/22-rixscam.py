@@ -2,7 +2,7 @@ import numpy as np
 from ophyd.areadetector import AreaDetector, HDF5Plugin
 from ophyd.areadetector.plugins import PluginBase, ImagePlugin
 from ophyd.areadetector.cam import ADCpt
-
+from ophyd.areadetector.trigger_mixins import ADTriggerStatus
 from ophyd.areadetector.filestore_mixins import (FileStoreHDF5IterativeWrite,
                                                  FileStorePluginBase,
                                                  FileStoreIterativeWrite)
@@ -15,7 +15,6 @@ from ophyd.device import Staged
 from ophyd.sim import NullStatus
 from databroker.assets.handlers_base import HandlerBase
 import time as ttime
-from threading import RLock, Timer
 import os.path
 import h5py
 
@@ -334,6 +333,15 @@ class RIXSCamHDF5PluginForXIP(HDF5Plugin, FileStoreHDF5SingleIterativeWrite):
         self._generate_resource(resource_kwargs)
 
 
+class RIXSCamTriggerStatus(ADTriggerStatus):
+    # Based on HXN profile collection eiger
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if not self.done:
+            self.target_count = self.device.cam.num_images.get()
+            self.current_count = self.device.cam.array_counter.get()
+
+
 class RIXSSingleTrigger(SingleTrigger):
     '''Modifies the `trigger` attribute so that it triggers the 2 hdf5 files
     independently.
@@ -345,58 +353,8 @@ class RIXSSingleTrigger(SingleTrigger):
     the event document as a ragged array.
     '''
 
-    acquisition_timeout_margin = 30.0
-
-    def __init__(self, *args, **kwargs):
-        self._acquisition_lock = RLock()
-        self._acquisition_timer = None
-        self._centroid_status = None
-        super().__init__(*args, **kwargs)
-
-    def _cancel_acquisition_timer(self):
-        if self._acquisition_timer is not None:
-            self._acquisition_timer.cancel()
-            self._acquisition_timer = None
-
-    def _fail_acquisition(self, error):
-        self._cancel_acquisition_timer()
-        acquisition_status = self._status
-        centroid_status = self._centroid_status
-        self._status = None
-        self._centroid_status = None
-        for status in (acquisition_status, centroid_status):
-            if status is not None and not status.done:
-                status.set_exception(error)
-
-    def _stop_acquisition(self):
-        try:
-            self._acquisition_signal.put(0, wait=False, timeout=1.0)
-        except Exception:
-            self.log.exception("Could not stop camera acquisition")
-
-    def _acquisition_timed_out(self, status):
-        with self._acquisition_lock:
-            # Ignore stale timers or completed statuses. A stuck Acquire PV
-            # never produces the 1 -> 0 completion edge, so the current status
-            # remains unfinished and falls through to timeout handling below.
-            if self._status is not status or status.done:
-                return
-            self._fail_acquisition(RuntimeError(
-                "Camera was stuck in acquire mode, scan terminated."
-            ))
-            self._stop_acquisition()
-
-    def _acquire_changed(self, value=None, old_value=None, **kwargs):
-        with self._acquisition_lock:
-            super()._acquire_changed(value=value, old_value=old_value, **kwargs)
-            if self._status is None:
-                self._cancel_acquisition_timer()
-
-    def stop(self, *, success=False):
-        with self._acquisition_lock:
-            self._fail_acquisition(RuntimeError("Camera acquisition stopped"))
-            self._stop_acquisition()
-        return super().stop(success=success)
+    _status_type = RIXSCamTriggerStatus
+    acquisition_timeout_margin = 30 #seconds
 
     def _centroid_enabled(self):
         return bool(self.centroid_enable.get())
@@ -417,14 +375,12 @@ class RIXSSingleTrigger(SingleTrigger):
         return data
 
     def _centroid_collection(self, value=None, old_value=None, **kwargs):
-        with self._acquisition_lock:
-            self._collect_centroid_frame(value=value, old_value=old_value,
-                                         **kwargs)
-
-    def _collect_centroid_frame(self, value=None, old_value=None, **kwargs):
         status = self._centroid_status
         if status is None:
             return
+        # does this matter as a change?
+        # if status.done:
+        #     return
 
         if value is None:
             return
@@ -442,7 +398,10 @@ class RIXSSingleTrigger(SingleTrigger):
             self._centroid_status = None
             status.set_finished()
 
-
+    def _acquisition_timeout(self):
+        acquisition_time_per_image = float(self.cam.acquire_time.get())
+        return (int(self.cam.num_images.get()) * acquisition_time_per_image) + self.acquisition_timeout_margin
+    
     def stage(self):
         ret = super().stage()
         self._centroid_status = None
@@ -457,28 +416,15 @@ class RIXSSingleTrigger(SingleTrigger):
         return ret
 
     def trigger(self):
-        with self._acquisition_lock:
-            return self._trigger_acquisition()
-
-    def _trigger_acquisition(self):
         if self._staged != Staged.yes:
             raise RuntimeError("This detector is not ready to trigger."
                                "Call the stage() method before triggering.")
 
-        if self._status is not None or self._centroid_status is not None:
-            raise RuntimeError("Camera acquisition is already in progress.")
-
-        num_images = int(self.cam.num_images.get())
-        expected_duration = num_images * max(
-            float(self.cam.acquire_time.get()),
-            float(self.cam.acquire_period.get()),
-        )
-        self._status = self._status_type(self, call_stop_on_failure=False)
-        acquisition_status = self._status
+        self._status = self._status_type(self)
         centroid_enabled = self._centroid_enabled()
         if centroid_enabled:
             self._centroid_cache = []
-            self._centroid_frames_per_point = num_images
+            self._centroid_frames_per_point = int(self.cam.num_images.get())
             self._centroid_timestamp = ttime.time()
             centroid_status = Status(obj=self)
             self._centroid_status = centroid_status
@@ -486,39 +432,14 @@ class RIXSSingleTrigger(SingleTrigger):
                 self._centroid_status = None
                 centroid_status.set_finished()
 
-        self._acquisition_timer = Timer(
-            expected_duration + self.acquisition_timeout_margin,
-            self._acquisition_timed_out,
-            args=(acquisition_status,),
-        )
-        self._acquisition_timer.daemon = True
-        self._acquisition_timer.start()
-        try:
-            self._acquisition_signal.put(1, wait=False)
-            # Here we do away with the `dispatch` method used in `SingleTrigger` as
-            # that gives the same field to multiple datafiles which DB can't handle
-            self.hdf5.generate_datum('rixscam_image', ttime.time(), {})
-        except Exception as exc:
-            self._fail_acquisition(exc)
-            self._stop_acquisition()
-            raise
+        self._acquisition_signal.put(1, wait=False)
+        # Here we do away with the `dispatch` method used in `SingleTrigger` as
+        # that gives the same field to multiple datafiles which DB can't handle
+        self.hdf5.generate_datum('rixscam_image', ttime.time(), {})
         if centroid_enabled:
             #self.hdf2.generate_datum('rixscam_centroids', ttime.time(), {})
-            trigger_status = Status(obj=self)
-
-            def finish_trigger(status):
-                with self._acquisition_lock:
-                    if trigger_status.done:
-                        return
-                    if not status.success:
-                        trigger_status.set_exception(status.exception())
-                    elif acquisition_status.done and centroid_status.done:
-                        trigger_status.set_finished()
-
-            acquisition_status.add_callback(finish_trigger)
-            centroid_status.add_callback(finish_trigger)
-            return trigger_status
-        return acquisition_status
+            return self._status & centroid_status
+        return self._status
 
     def read(self):
         ret = super().read()
@@ -565,12 +486,6 @@ class RIXSSingleTrigger(SingleTrigger):
         return ret
 
     def unstage(self):
-        with self._acquisition_lock:
-            pending = (self._status is not None or
-                       self._centroid_status is not None)
-            self._fail_acquisition(RuntimeError("Camera acquisition unstaged"))
-            if pending:
-                self._stop_acquisition()
         subscription = getattr(self, '_centroid_subscription', None)
         if subscription is not None:
             self.image2.array_data.unsubscribe(subscription)
